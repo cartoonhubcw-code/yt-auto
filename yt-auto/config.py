@@ -12,6 +12,7 @@ VOICE = "en-IN-NeerjaNeural"
 VOICE_RATE = "+0%"                        # e.g. "-5%" slower, "+10%" faster
 
 # ---- Video ----
+VISUAL_MODE = "animated"                # "animated" (motion graphics, no keys needed) or "stock" (Pexels/Pixabay footage)
 WIDTH, HEIGHT, FPS = 1280, 720, 30
 CAPTIONS = True                           # burn subtitles into the video
 

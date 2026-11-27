@@ -8,6 +8,7 @@ from pathlib import Path
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+import animate
 import config
 
 PAD = 0.5  # seconds of silence after each scene's narration
@@ -57,45 +58,82 @@ def make_slide(text: str, idx: int, out_path: str):
     img.save(out_path)
 
 
-def fetch_pexels_clip(keyword: str, out_path: str, used_ids: set):
-    """Return (path, credit) or (None, None). Needs PEXELS_API_KEY (free)."""
+def _download(url, out_path):
+    with requests.get(url, stream=True, timeout=120) as dl:
+        dl.raise_for_status()
+        with open(out_path, "wb") as fh:
+            for chunk in dl.iter_content(1 << 20):
+                fh.write(chunk)
+
+
+def _pexels(keyword, out_path, used_ids):
     key = os.getenv("PEXELS_API_KEY")
     if not key:
         return None, None
-    try:
-        r = requests.get(
-            "https://api.pexels.com/videos/search",
-            headers={"Authorization": key},
-            params={"query": keyword, "orientation": "landscape", "size": "medium", "per_page": 10},
-            timeout=30,
-        )
-        r.raise_for_status()
-        videos = [v for v in r.json().get("videos", []) if v["id"] not in used_ids]
-        if not videos:
-            return None, None
-        v = random.choice(videos[:6])
-        files = [f for f in v["video_files"] if f.get("file_type") == "video/mp4" and f.get("width")]
-        if not files:
-            return None, None
-        f = min(files, key=lambda x: abs(x["width"] - W))
-        with requests.get(f["link"], stream=True, timeout=120) as dl:
-            dl.raise_for_status()
-            with open(out_path, "wb") as fh:
-                for chunk in dl.iter_content(1 << 20):
-                    fh.write(chunk)
-        used_ids.add(v["id"])
-        return out_path, v.get("user", {}).get("name")
-    except Exception as e:  # noqa: BLE001
-        print(f"[pexels] '{keyword}' failed: {e}")
+    r = requests.get(
+        "https://api.pexels.com/videos/search",
+        headers={"Authorization": key},
+        params={"query": keyword, "orientation": "landscape", "size": "medium", "per_page": 10},
+        timeout=30,
+    )
+    r.raise_for_status()
+    videos = [v for v in r.json().get("videos", []) if ("px", v["id"]) not in used_ids]
+    if not videos:
         return None, None
+    v = random.choice(videos[:6])
+    files = [f for f in v["video_files"] if f.get("file_type") == "video/mp4" and f.get("width")]
+    if not files:
+        return None, None
+    f = min(files, key=lambda x: abs(x["width"] - W))
+    _download(f["link"], out_path)
+    used_ids.add(("px", v["id"]))
+    return out_path, f"{v.get('user', {}).get('name', 'unknown')} / Pexels"
+
+
+def _pixabay(keyword, out_path, used_ids):
+    key = os.getenv("PIXABAY_API_KEY")
+    if not key:
+        return None, None
+    r = requests.get(
+        "https://pixabay.com/api/videos/",
+        params={"key": key, "q": keyword[:100], "video_type": "film", "per_page": 20, "safesearch": "true"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    hits = [h for h in r.json().get("hits", []) if ("pb", h["id"]) not in used_ids]
+    if not hits:
+        return None, None
+    h = random.choice(hits[:8])
+    for size in ("medium", "large", "small"):
+        url = (h.get("videos", {}).get(size) or {}).get("url")
+        if url:
+            _download(url, out_path)
+            used_ids.add(("pb", h["id"]))
+            return out_path, f"{h.get('user', 'unknown')} / Pixabay"
+    return None, None
+
+
+def fetch_clip(keyword: str, out_path: str, used_ids: set):
+    """Return (path, credit) or (None, None). Tries Pexels, then Pixabay (both free)."""
+    for fn in (_pexels, _pixabay):
+        try:
+            path, credit = fn(keyword, out_path, used_ids)
+            if path:
+                return path, credit
+        except Exception as e:  # noqa: BLE001
+            print(f"[stock] {fn.__name__} '{keyword}' failed: {e}")
+    return None, None
 
 
 # ---------------- assembly ----------------
-def build_scene(i, scene, audio, work: Path, used_ids):
+def build_scene(i, scene, audio, work: Path, used_ids, ti=0, t_offset=0.0):
     audio_dur = duration(audio)
     seg_dur = audio_dur + PAD
     seg = work / f"seg{i}.mp4"
-    clip, credit = fetch_pexels_clip(scene["visual_keyword"], str(work / f"clip{i}.mp4"), used_ids)
+    if config.VISUAL_MODE == "animated":
+        animate.render_segment(scene, audio, seg_dur, PAD, seg, ti, t_offset)
+        return seg, audio_dur, None
+    clip, credit = fetch_clip(scene["visual_keyword"], str(work / f"clip{i}.mp4"), used_ids)
 
     vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
           f"fps={FPS},format=yuv420p")
@@ -139,8 +177,9 @@ def build_srt(timings, path, words_per_line=7):
 def assemble(script, audios, work: Path):
     """Returns (final_video_path, credits list)."""
     used_ids, segs, timings, credits, cursor = set(), [], [], [], 0.0
+    ti = animate.theme_for(script["title"])
     for i, (scene, audio) in enumerate(zip(script["scenes"], audios)):
-        seg, adur, credit = build_scene(i, scene, audio, work, used_ids)
+        seg, adur, credit = build_scene(i, scene, audio, work, used_ids, ti, cursor)
         segs.append(seg)
         timings.append((cursor, adur, scene["narration"]))
         cursor += adur + PAD
@@ -166,7 +205,7 @@ def assemble(script, audios, work: Path):
 
 def make_thumbnail(video: Path, title: str, out_path: Path):
     frame = out_path.with_suffix(".frame.jpg")
-    run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "1.5", "-i", str(video),
+    run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "2.5", "-i", str(video),
          "-frames:v", "1", str(frame)])
     img = Image.open(frame).convert("RGB").resize((W, H))
     shade = Image.new("RGBA", (W, H), (0, 0, 0, 0))
