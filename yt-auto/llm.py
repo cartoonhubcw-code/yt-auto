@@ -47,7 +47,7 @@ def _providers():
     because free-tier model availability changes over time."""
     out = []
     if os.getenv("GEMINI_API_KEY"):
-        for m in os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(","):
+        for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash,gemini-3.5-flash-lite").split(","):
             m = m.strip()
             if m:
                 out.append((f"gemini:{m}", lambda p, m=m: _gemini(p, m)))
