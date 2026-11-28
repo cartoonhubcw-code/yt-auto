@@ -8,11 +8,11 @@ from pathlib import Path
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-import animate
+import animations
+import blender_render
 import config
 
-PAD = 0.5  # seconds of silence after each scene's narration
-W, H, FPS = config.WIDTH, config.HEIGHT, config.FPS
+FPS = config.FPS
 FONTS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
@@ -45,95 +45,88 @@ def font(size):
 
 
 # ---------------- visuals ----------------
-def make_slide(text: str, idx: int, out_path: str):
+def make_slide(text: str, idx: int, out_path: str, fmt: dict):
+    W, H = fmt["width"], fmt["height"]
     top, bot = PALETTES[idx % len(PALETTES)]
     img = Image.new("RGB", (W, H))
     d = ImageDraw.Draw(img)
     for y in range(H):
         t = y / H
         d.line([(0, y), (W, y)], fill=tuple(int(top[i] + (bot[i] - top[i]) * t) for i in range(3)))
-    wrapped = "\n".join(textwrap.wrap(text, 24))
-    d.multiline_text((W / 2, H / 2), wrapped, font=font(72), fill="white",
+    wrapped = "\n".join(textwrap.wrap(text, fmt["slide_wrap"]))
+    d.multiline_text((W / 2, H / 2), wrapped, font=font(fmt["slide_font"]), fill="white",
                      anchor="mm", align="center", spacing=14)
     img.save(out_path)
 
 
-def _download(url, out_path):
-    with requests.get(url, stream=True, timeout=120) as dl:
-        dl.raise_for_status()
-        with open(out_path, "wb") as fh:
-            for chunk in dl.iter_content(1 << 20):
-                fh.write(chunk)
-
-
-def _pexels(keyword, out_path, used_ids):
+def fetch_pexels_clip(keyword: str, out_path: str, used_ids: set, fmt: dict):
+    """Return (path, credit) or (None, None). Needs PEXELS_API_KEY (free)."""
     key = os.getenv("PEXELS_API_KEY")
     if not key:
         return None, None
-    r = requests.get(
-        "https://api.pexels.com/videos/search",
-        headers={"Authorization": key},
-        params={"query": keyword, "orientation": "landscape", "size": "medium", "per_page": 10},
-        timeout=30,
-    )
-    r.raise_for_status()
-    videos = [v for v in r.json().get("videos", []) if ("px", v["id"]) not in used_ids]
-    if not videos:
+    try:
+        r = requests.get(
+            "https://api.pexels.com/videos/search",
+            headers={"Authorization": key},
+            params={"query": keyword, "orientation": fmt["orientation"], "size": "medium", "per_page": 10},
+            timeout=30,
+        )
+        r.raise_for_status()
+        videos = [v for v in r.json().get("videos", []) if v["id"] not in used_ids]
+        if not videos:
+            return None, None
+        v = random.choice(videos[:6])
+        files = [f for f in v["video_files"] if f.get("file_type") == "video/mp4" and f.get("width")]
+        if not files:
+            return None, None
+        f = min(files, key=lambda x: abs(x["width"] - fmt["width"]))
+        with requests.get(f["link"], stream=True, timeout=120) as dl:
+            dl.raise_for_status()
+            with open(out_path, "wb") as fh:
+                for chunk in dl.iter_content(1 << 20):
+                    fh.write(chunk)
+        used_ids.add(v["id"])
+        return out_path, v.get("user", {}).get("name")
+    except Exception as e:  # noqa: BLE001
+        print(f"[pexels] '{keyword}' failed: {e}")
         return None, None
-    v = random.choice(videos[:6])
-    files = [f for f in v["video_files"] if f.get("file_type") == "video/mp4" and f.get("width")]
-    if not files:
-        return None, None
-    f = min(files, key=lambda x: abs(x["width"] - W))
-    _download(f["link"], out_path)
-    used_ids.add(("px", v["id"]))
-    return out_path, f"{v.get('user', {}).get('name', 'unknown')} / Pexels"
-
-
-def _pixabay(keyword, out_path, used_ids):
-    key = os.getenv("PIXABAY_API_KEY")
-    if not key:
-        return None, None
-    r = requests.get(
-        "https://pixabay.com/api/videos/",
-        params={"key": key, "q": keyword[:100], "video_type": "film", "per_page": 20, "safesearch": "true"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    hits = [h for h in r.json().get("hits", []) if ("pb", h["id"]) not in used_ids]
-    if not hits:
-        return None, None
-    h = random.choice(hits[:8])
-    for size in ("medium", "large", "small"):
-        url = (h.get("videos", {}).get(size) or {}).get("url")
-        if url:
-            _download(url, out_path)
-            used_ids.add(("pb", h["id"]))
-            return out_path, f"{h.get('user', 'unknown')} / Pixabay"
-    return None, None
-
-
-def fetch_clip(keyword: str, out_path: str, used_ids: set):
-    """Return (path, credit) or (None, None). Tries Pexels, then Pixabay (both free)."""
-    for fn in (_pexels, _pixabay):
-        try:
-            path, credit = fn(keyword, out_path, used_ids)
-            if path:
-                return path, credit
-        except Exception as e:  # noqa: BLE001
-            print(f"[stock] {fn.__name__} '{keyword}' failed: {e}")
-    return None, None
 
 
 # ---------------- assembly ----------------
-def build_scene(i, scene, audio, work: Path, used_ids, ti=0, t_offset=0.0):
+_STATE = {"n3d": 0}
+
+
+def build_scene(i, scene, audio, work: Path, used_ids, fmt: dict, script_title=""):
+    W, H, PAD = fmt["width"], fmt["height"], fmt["pad"]
     audio_dur = duration(audio)
     seg_dur = audio_dur + PAD
     seg = work / f"seg{i}.mp4"
-    if config.VISUAL_MODE == "animated":
-        animate.render_segment(scene, audio, seg_dur, PAD, seg, ti, t_offset)
-        return seg, audio_dur, None
-    clip, credit = fetch_clip(scene["visual_keyword"], str(work / f"clip{i}.mp4"), used_ids)
+
+    # Free animated visual (drawn in code). Falls back to stock footage / slide if anything goes wrong.
+    vis = scene.get("visual")
+    if isinstance(vis, dict) and str(vis.get("type")) in blender_render.TEMPLATES:
+        # Real 3D (Blender) only where Gemini asked for it, max N per video, otherwise 2D version
+        if blender_render.available() and _STATE["n3d"] < fmt["max_3d"]:
+            _STATE["n3d"] += 1
+            try:
+                blender_render.render_scene(vis, scene, seg_dur, audio, seg, W, H, FPS, PAD,
+                                            animations.theme_for(script_title), work, i)
+                return seg, audio_dur, None
+            except Exception as e:  # noqa: BLE001
+                print(f"[blender] scene {i} failed, using 2D fallback: {e}")
+        vis = dict(vis, type=blender_render.FALLBACK_2D[str(vis["type"])])
+    # Vertical (Short): the subtitles live in the lower area, so drop the animation's own bottom
+    # caption (blocks / bars / wave) - it would overlap, and it just repeats the narration.
+    if H > W and isinstance(vis, dict) and vis.get("type") in ("blocks", "bars", "wave"):
+        vis = dict(vis, text="")
+    if config.ANIMATED_VISUALS and not (isinstance(vis, dict) and vis.get("type") == "stock"):
+        try:
+            animations.render_scene(vis, scene, seg_dur, audio, seg, W, H, FPS, PAD,
+                                    animations.theme_for(script_title))
+            return seg, audio_dur, None
+        except Exception as e:  # noqa: BLE001
+            print(f"[animation] scene {i} failed, using fallback: {e}")
+    clip, credit = fetch_pexels_clip(scene["visual_keyword"], str(work / f"clip{i}.mp4"), used_ids, fmt)
 
     vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
           f"fps={FPS},format=yuv420p")
@@ -141,7 +134,7 @@ def build_scene(i, scene, audio, work: Path, used_ids, ti=0, t_offset=0.0):
         vin = ["-stream_loop", "-1", "-i", clip]
     else:
         slide = str(work / f"slide{i}.png")
-        make_slide(scene.get("on_screen_text") or scene["visual_keyword"], i, slide)
+        make_slide(scene.get("on_screen_text") or scene["visual_keyword"], i, slide, fmt)
         vin = ["-loop", "1", "-framerate", str(FPS), "-i", slide]
 
     run(["ffmpeg", "-y", "-loglevel", "error", *vin, "-i", str(audio),
@@ -174,15 +167,15 @@ def build_srt(timings, path, words_per_line=7):
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
-def assemble(script, audios, work: Path):
+def assemble(script, audios, work: Path, fmt: dict):
     """Returns (final_video_path, credits list)."""
+    _STATE["n3d"] = 0
     used_ids, segs, timings, credits, cursor = set(), [], [], [], 0.0
-    ti = animate.theme_for(script["title"])
     for i, (scene, audio) in enumerate(zip(script["scenes"], audios)):
-        seg, adur, credit = build_scene(i, scene, audio, work, used_ids, ti, cursor)
+        seg, adur, credit = build_scene(i, scene, audio, work, used_ids, fmt, script["title"])
         segs.append(seg)
         timings.append((cursor, adur, scene["narration"]))
-        cursor += adur + PAD
+        cursor += adur + fmt["pad"]
         if credit:
             credits.append(credit)
 
@@ -191,8 +184,8 @@ def assemble(script, audios, work: Path):
          "-c", "copy", "nocap.mp4"], cwd=work)
 
     if config.CAPTIONS:
-        build_srt(timings, work / "captions.srt")
-        style = "Fontname=DejaVu Sans,Fontsize=12,Bold=1,Outline=2,Shadow=0,MarginV=36"
+        build_srt(timings, work / "captions.srt", fmt["words_per_caption"])
+        style = fmt["caption_style"]
         run(["ffmpeg", "-y", "-loglevel", "error", "-i", "nocap.mp4",
              "-vf", f"subtitles=captions.srt:force_style='{style}'",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy",
@@ -203,9 +196,10 @@ def assemble(script, audios, work: Path):
     return work / "final.mp4", sorted(set(credits))
 
 
-def make_thumbnail(video: Path, title: str, out_path: Path):
+def make_thumbnail(video: Path, title: str, out_path: Path, fmt: dict):
+    W, H = fmt["width"], fmt["height"]
     frame = out_path.with_suffix(".frame.jpg")
-    run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "2.5", "-i", str(video),
+    run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "1.5", "-i", str(video),
          "-frames:v", "1", str(frame)])
     img = Image.open(frame).convert("RGB").resize((W, H))
     shade = Image.new("RGBA", (W, H), (0, 0, 0, 0))

@@ -5,7 +5,7 @@ import time
 import config
 
 
-def synth(text: str, out_path: str, dry_run: bool = False) -> str:
+def synth(text: str, out_path: str, dry_run: bool = False, rate: str | None = None) -> str:
     if dry_run:  # silent placeholder audio, length based on word count
         secs = max(2.0, len(text.split()) / 2.6)
         subprocess.run(
@@ -18,7 +18,7 @@ def synth(text: str, out_path: str, dry_run: bool = False) -> str:
     import edge_tts
 
     async def _go():
-        await edge_tts.Communicate(text, config.VOICE, rate=config.VOICE_RATE).save(out_path)
+        await edge_tts.Communicate(text, config.VOICE, rate=rate or config.VOICE_RATE).save(out_path)
 
     last = None
     for _ in range(4):

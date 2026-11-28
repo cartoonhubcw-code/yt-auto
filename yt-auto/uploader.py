@@ -27,20 +27,27 @@ def _service():
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 
-def next_publish_time() -> str:
-    """Next occurrence of the configured local time, at least 1 hour away, in UTC ISO format."""
+def next_publish_time(hour=None, minute=None) -> str:
+    """Next occurrence of the given local time, at least 1 hour away, in UTC ISO format."""
+    hour = config.PUBLISH_HOUR if hour is None else hour
+    minute = config.PUBLISH_MINUTE if minute is None else minute
     tz = ZoneInfo(config.PUBLISH_TZ)
     now = datetime.now(tz)
-    t = now.replace(hour=config.PUBLISH_HOUR, minute=config.PUBLISH_MINUTE, second=0, microsecond=0)
+    t = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if t - now < timedelta(hours=1):
         t += timedelta(days=1)
     return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def upload(video: Path, thumb: Path, title, description, tags):
+def upload(video: Path, thumb, title, description, tags, short=False):
+    """short=True: uses the Short publish time + tags and skips the thumbnail."""
     yt = _service()
-    publish_at = next_publish_time()
-    tags = (list(tags) + config.DEFAULT_TAGS)[:15]
+    if short:
+        publish_at = next_publish_time(config.SHORT_PUBLISH_HOUR, config.SHORT_PUBLISH_MINUTE)
+        tags = (list(tags) + config.SHORT_TAGS)[:15]
+    else:
+        publish_at = next_publish_time()
+        tags = (list(tags) + config.DEFAULT_TAGS)[:15]
     while sum(len(t) + 1 for t in tags) > 450:
         tags.pop()
     body = {
@@ -64,6 +71,8 @@ def upload(video: Path, thumb: Path, title, description, tags):
         _, resp = req.next_chunk()
     vid = resp["id"]
 
+    if short or thumb is None:   # Shorts use an auto frame; no custom thumbnail
+        return vid, publish_at
     try:  # custom thumbnails need a phone-verified channel; don't fail the run if not
         yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(str(thumb))).execute()
     except HttpError as e:
